@@ -1,0 +1,92 @@
+#!/usr/bin/python
+#
+# vhostsnoop  Trace vhost ioctls 
+#
+# USAGE: vhostsnoop PID
+#
+# This uses kprobes on specific vhost functions
+#
+from bcc import BPF
+from bcc.utils import printb
+from time import strftime
+
+import argparse
+
+import vhost
+
+parser = argparse.ArgumentParser(
+        description="Snoop vhost ioctls and print them nicely",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+
+parser.add_argument("-p", "--pid", help="PID of the vhost frontend (i.e: qemu)")
+
+args = parser.parse_args()
+
+bpf_text = """
+#include <linux/vhost.h>
+#include <linux/fs.h>
+
+struct data_t {
+    unsigned long ts;
+    unsigned int ioctl;
+};
+
+BPF_PERF_OUTPUT(events);
+
+int do_vhost_net_ioctl(struct pt_regs *ctx, struct file *f, unsigned int ioctl, unsigned long arg)
+{
+    struct data_t data = {};
+    u64 tsp;
+    u32 pid = bpf_get_current_pid_tgid();
+    FILTER
+
+    tsp = bpf_ktime_get_ns();
+
+    data.ioctl = ioctl;
+    data.ts = tsp / 1000;
+
+    events.perf_submit(ctx, &data, sizeof(data));
+    return 0;
+}
+
+"""
+
+if args.pid:
+    print ("Tracing PID %s\n" % args.pid)
+    bpf_text = bpf_text.replace('FILTER',
+        'if (pid != %s) { return 0; }' % args.pid)
+else:
+    bpf_text = bpf_text.replace('FILTER', '')
+
+b = BPF(text=bpf_text)
+b.attach_kprobe(event="vhost_net_ioctl", fn_name="do_vhost_net_ioctl")
+
+initial_ts = 0
+
+print("%-14s" % ("TIME(s)"), end = "")
+print("IOCTL")
+
+
+def print_event(cpu, data, size):
+    global initial_ts
+
+    event = b["events"].event(data)
+
+    if not initial_ts:
+        initial_ts = event.ts
+    delta = event.ts - initial_ts
+    printb(b"%-14.9f" % (float(delta) / 1000000), nl="")
+    #printb(b'0x%x' % event.ioctl)
+    vhost.print_vhost_cmd(event.ioctl)
+
+
+b["events"].open_perf_buffer(print_event, page_cnt=64)
+
+while True:
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()
+
+
+
